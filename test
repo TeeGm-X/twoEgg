@@ -1,0 +1,1251 @@
+package com.yl.prod.service.target_control.cost.deployer.impl;
+
+import com.baomidou.mybatisplus.core.conditions.Wrapper;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.github.pagehelper.Page;
+import com.github.pagehelper.PageHelper;
+import com.yl.common.core.exception.ServiceException;
+import com.yl.common.domain.RestResponse;
+import com.yl.common.domain.model.BaseCondition;
+import com.yl.common.entity.target_control.cost.deployer.*;
+import com.yl.common.entity.target_control.cost.targets.ProdCostTarget;
+import com.yl.common.entity.target_control.cost.targets.ProdCostTargetCentre;
+import com.yl.common.entity.target_control.cost.targets.ProdCostTargetCentreTwo;
+import com.yl.common.entity.target_control.cost.targets.ProdCostTargetItem;
+import com.yl.common.entity.target_control.plan_and_task.produce_task.ProduceTask;
+import com.yl.common.entity.target_control.plan_and_task.produce_task.ProduceTaskDept;
+import com.yl.common.entity.warehouse.material.applicant.MesWarehouseApplicantMaterial;
+import com.yl.common.enums.*;
+import com.yl.common.enums.cost.CostControlTargetTypeEnum;
+import com.yl.common.enums.cost.CostDeployerTypeEnum;
+import com.yl.common.enums.cost.CostExpensesEnum;
+import com.yl.common.model.target_control.cost.deployer.*;
+import com.yl.common.utils.*;
+import com.yl.common.utils.domain.TreeUtils;
+import com.yl.common.utils.web.WebAuditUtil;
+import com.yl.prod.mapper.target_control.cost.deployer.CostDeployerMapper;
+import com.yl.prod.service.target_control.cost.deployer.*;
+import com.yl.prod.service.target_control.cost.material_plan.CostMaterialPlanStockNewService;
+import com.yl.prod.service.target_control.cost.targets.ProdCostTargetService;
+import com.yl.prod.service.target_control.plan_and_task.produce_task.ProduceTaskDeptService;
+import com.yl.prod.service.target_control.plan_and_task.produce_task.ProduceTaskService;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+public class CostDeployerServiceImpl extends ServiceImpl<CostDeployerMapper, CostDeployer> implements CostDeployerService {
+    @Autowired
+    ProduceTaskService taskService;
+    @Autowired
+    ProduceTaskDeptService taskDeptService;
+    @Autowired
+    private ProdCostTargetService targetService;
+    @Autowired
+    private CostDeployerCentreService centreService;
+    @Autowired
+    private CostDeployerDeptService deptService;
+    @Autowired
+    private CostDeployerCentreSecondService centreSecondService;
+    @Autowired
+    private CostDeployerMaterialPowerTransportService itemService;
+    @Autowired
+    private ApplicationEventPublisher applicationEventPublisher;
+    @Autowired
+    private CostMaterialPlanStockNewService materialPlanStockNewService;
+
+    private static CostDeployerMaterialPowerTransport getCostDeployerItem(ProdCostTargetItem i) {
+        CostDeployerMaterialPowerTransport item = new CostDeployerMaterialPowerTransport();
+        // 主料辅料能源动力包装明细
+        item.setMaterial(i.getMaterial());
+        // 成本控制项目名称
+        item.setCostProjectName(i.getControlProjectName());
+        // 物资类别 | 能源动力名称
+        item.setMaterialType(i.getMaterialTypeName());
+        // 物资名称 | 规格 | 运输对象
+        item.setMaterialName(i.getMaterialTypeName());
+        // 单位产品用量-标准值  | 产品成本控制目标(运输)
+        item.setMaterialUnitUseNum(i.getUnitProductUseNum());
+        // 不含税价格(对应目标价格)
+        item.setTargetPrice(i.getMaterialTargetPrice());
+        // 是否目标激励
+        item.setIsTargetImpel(i.getIsEncourage());
+        // 是否部署下级
+        item.setIsDeployerLow(false);
+        // 是否忽略
+        item.setIsIgnore(false);
+        // 目标控制成本项目id
+        item.setTargetCostControlProjectId(i.getId());
+        // 排序
+        item.setSort(i.getSort());
+        // 单位
+        item.setMaterialUnit(i.getMaterialUnit());
+        return item;
+    }
+
+    @Override
+    public RestResponse<List<CostDeployer>> pageA(BaseCondition condition) {
+        Page<CostDeployer> page = PageHelper.startPage(condition.getPageNum(), condition.getPageSize());
+        List<ProdCostTarget> targetList = targetService.list(pageWrapper(condition));
+        List<CostDeployer> list = targetListToList(targetList);
+        this.getDeployerList(list);
+        return RestResponse.page(list, page.toPageInfo());
+    }
+
+    /**
+     * 目标转部署
+     *
+     * @param targetList 目标列表
+     * @return {@link List}<{@link CostDeployer}>
+     */
+    private List<CostDeployer> targetListToList(List<ProdCostTarget> targetList) {
+        if (targetList.isEmpty()) {
+            return new ArrayList<>();
+        }
+        return targetList.stream()
+                .map(target -> {
+                    CostDeployer li = new CostDeployer();
+                    // 生产计划id
+                    li.setPlanId(target.getPlanId());
+                    // 控制目标id
+                    li.setTargetId(target.getId());
+                    // 生产计划编号
+                    li.setPlanOdd(target.getPlanOdd());
+                    // 生产计划日期-起
+                    li.setStartDate(target.getStartDate());
+                    // 生产计划日期-止
+                    li.setEndDate(target.getEndDate());
+                    // 部署对象
+                    li.setProductName(target.getProductName());
+                    // 产品单位
+                    li.setProductUnit(target.getProductUnit());
+                    // 规格型号id
+                    li.setModelId(target.getModelId());
+                    // 规格型号
+                    li.setModelName(target.getModelName());
+                    // 计划产量
+                    li.setPlanOutPut(target.getPlanOutPut());
+                    return li;
+                }).collect(Collectors.toList());
+
+    }
+
+    /**
+     * 分页中部署的信息
+     *
+     * @param list 列表
+     */
+    private void getDeployerList(List<CostDeployer> list) {
+        if (list.isEmpty()) {
+            return;
+        }
+        List<String> ids = list.stream()
+                .map(CostDeployer::getTargetId).collect(Collectors.toList());
+        List<CostDeployer> deployerList = this.list(Wrappers.<CostDeployer>lambdaQuery()
+                .in(CostDeployer::getTargetId, ids)
+                .eq(CostDeployer::getDeployerLevel, 1));
+        Map<String, List<CostDeployer>> map = deployerList.stream()
+                .collect(Collectors.groupingBy(CostDeployer::getTargetId));
+        if (map.size() > 0) {
+            list.forEach(l -> {
+                List<CostDeployer> costDeployers = map.get(l.getTargetId());
+                if (costDeployers == null || costDeployers.isEmpty()) {
+                    return;
+                }
+                l.setId(costDeployers.get(0).getId());
+                l.setDeployerState(costDeployers.get(0).getDeployerState());
+                l.setAuditState(costDeployers.get(0).getAuditState());
+            });
+        } else {
+            list.forEach(l -> l.setId(null));
+        }
+    }
+
+    /**
+     * 分页包装器
+     *
+     * @param condition 条件
+     * @return {@link Wrapper}<{@link ProdCostTarget}>
+     */
+    private Wrapper<ProdCostTarget> pageWrapper(BaseCondition condition) {
+        return Wrappers.<ProdCostTarget>lambdaQuery()
+                .eq(ProdCostTarget::getAuditState, AuditState.AUDIT_OK)
+                .like(IsUtils.notEmpty(condition.getName()), ProdCostTarget::getProductName, condition.getName())
+                .between(IsUtils.notEmpty(condition.getQueryStartDate(), condition.getQueryEndDate()), ProdCostTarget::getStartDate, condition.getQueryStartDate(), condition.getQueryEndDate())
+                .or()
+                .between(IsUtils.notEmpty(condition.getQueryStartDate(), condition.getQueryEndDate()), ProdCostTarget::getEndDate, condition.getQueryStartDate(), condition.getQueryEndDate());
+
+    }
+
+    @Override
+    public RestResponse<CostDeployer> getAdd(String planId, String taskDeptId) {
+        CostDeployer vo = new CostDeployer();
+        ProdCostTarget target = targetService.getDetailByPlanId(planId);
+        if (IsUtils.empty(target)) {
+            return RestResponse.error("未找到控制目标");
+        }
+        ProduceTask task = taskService.getDetail(planId).getData();
+        if (IsUtils.empty(task)) {
+            return RestResponse.error("生产任务不存在");
+        }
+        if (IsUtils.notEmpty(taskDeptId)) {
+            // 递归部门
+            task.setDeptList(this.getRecursionDept(taskDeptId, task.getDeptList()));
+        }
+        this.targetAndTaskToDeployer(target, task, vo);
+        vo.setTransportList(setTransportList(target));
+        return RestResponse.success(vo);
+    }
+
+    /**
+     * 得到递归部门
+     *
+     * @param taskDeptId 任务部门id
+     * @param deptList   部门列表
+     * @return {@link List}<{@link ProduceTaskDept}>
+     */
+    private List<ProduceTaskDept> getRecursionDept(String taskDeptId, List<ProduceTaskDept> deptList) {
+        if (deptList == null) {
+            return null;
+        }
+
+        for (ProduceTaskDept dept : deptList) {
+            if (taskDeptId.equals(dept.getId())) {
+                return dept.getChildren();
+            } else {
+                List<ProduceTaskDept> childrenResult = getRecursionDept(taskDeptId, dept.getChildren());
+                if (childrenResult != null) {
+                    return childrenResult;
+                }
+            }
+        }
+
+        return null;
+    }
+
+
+    /**
+     * 目标任务转部署
+     *
+     * @param target 目标
+     * @param task   任务
+     * @param vo     部署
+     */
+    private void targetAndTaskToDeployer(ProdCostTarget target, ProduceTask task, CostDeployer vo) {
+        if (IsUtils.empty(target, task)) {
+            return;
+        }
+        // 生产计划id
+        vo.setPlanId(target.getPlanId());
+        // 生产任务id
+        vo.setTaskId(task.getId());
+        // 控制目标id
+        vo.setTargetId(target.getId());
+        // 生产计划编号
+        vo.setPlanOdd(target.getPlanOdd());
+        // 生产计划日期-起
+        vo.setStartDate(target.getStartDate());
+        // 生产计划日期-止
+        vo.setEndDate(target.getEndDate());
+        // 部署对象
+        vo.setProductName(target.getProductName());
+        // 产品单位
+        vo.setProductUnit(target.getProductUnit());
+        // 规格型号id
+        vo.setModelId(target.getModelId());
+        // 规格型号
+        vo.setModelName(target.getModelName());
+        // 计划产量
+        vo.setPlanOutPut(target.getPlanOutPut());
+        // 成本控制目标
+        vo.setCostControlTarget(target.getProductionControlTarget());
+        // 部门List
+        vo.setDeptList(this.targetTaskToDeployer2(target, task));
+    }
+
+    /**
+     * 部门List
+     *
+     * @param target 目标
+     * @param task   任务
+     * @return {@link List}<{@link CostDeployerCentre}>
+     */
+    private List<CostDeployerDept> targetTaskToDeployer2(ProdCostTarget target, ProduceTask task) {
+        if (IsUtils.emptyList(task.getDeptList())) {
+            return null;
+        }
+        // 判断这个成本控制目标中是否存在于生产任务类型
+        return task.getDeptList().stream()
+                .map(i -> {
+                    CostDeployerDept dept = new CostDeployerDept();
+                    dept.setTaskTypeList(StringUtils.splitToList(i.getTaskType()));
+                    // 控制目标id
+                    dept.setTargetId(target.getId());
+                    // 部门id
+                    dept.setDeptId(i.getDeptId());
+                    // 部门名称
+                    dept.setDeptName(i.getDeptName());
+                    // 负责人
+                    dept.setDutyPersonName(i.getDutyUserName());
+                    // 部署级别
+                    dept.setDeployerLevel(i.getDeptLevel());
+                    // 产量目标
+                    dept.setProductionTargetNum(i.getTaskNum());
+                    // 成本控制目标
+                    dept.setCostControlTarget(target.getProductionControlTarget());
+                    // 是否部署
+                    dept.setIsDeployer(false);
+                    // 是否忽略
+                    dept.setIsIgnore(false);
+                    // 生产任务部门表id
+                    dept.setTaskDeptId(i.getId());
+                    // 排序
+                    dept.setSort(i.getSort());
+                    // 是否部署下级
+                    dept.setIsDeployerLow(null);
+                    // 制造/加工/包装
+                    dept.setCentreList(this.targetTaskToDeployer3(target.getCentreList(), i));
+                    return dept;
+                }).collect(Collectors.toList());
+    }
+
+    /**
+     * 制造/加工/包装
+     *
+     * @param centreList 目标对象列表
+     * @param i          任务部门
+     * @return {@link List}<{@link CostDeployerCentre}>
+     */
+    private List<CostDeployerCentre> targetTaskToDeployer3(List<ProdCostTargetCentre> centreList, ProduceTaskDept i) {
+        return centreList.stream().filter(j -> j.getCostControlTargetType() != null && (j.getCostControlTargetType()
+                        .equals(CostControlTargetTypeEnum.PRODUCTION) || j.getCostControlTargetType()
+                        .equals(CostControlTargetTypeEnum.PROCESS) || j.getCostControlTargetType()
+                        .equals(CostControlTargetTypeEnum.PACK)))
+                .filter(w -> this.isEqualsTaskType(w.getCostControlTargetType(), i.getTaskType()))
+                .map(j -> {
+                    CostDeployerCentre centre = new CostDeployerCentre();
+                    // 部署类别
+                    centre.setDeployerType(this.targetTypeToDeployerType(j.getCostControlTargetType()));
+                    // 主料/辅料/包装/能源动力
+                    centre.setCentreSecondList(this.targetTaskToDeployer4(j));
+                    return centre;
+                }).collect(Collectors.toList());
+    }
+
+    /**
+     * 主料/辅料/包装
+     *
+     * @param j j
+     * @return {@link List}<{@link CostDeployerCentreSecond}>
+     */
+    private List<CostDeployerCentreSecond> targetTaskToDeployer4(ProdCostTargetCentre j) {
+        if (IsUtils.emptyList(j.getCentreTwoList())) {
+            return null;
+        }
+        return j.getCentreTwoList().stream().filter(k -> k.getProductionControlTarget() != null && !k.getMaterial()
+                        .equals(MaterialEnum.TIME) && !k.getMaterial()
+                        .equals(MaterialEnum.PIECE))
+                .map(k -> {
+                    CostDeployerCentreSecond second = new CostDeployerCentreSecond();
+                    // 部署类别
+                    second.setDeployerType(this.targetTypeToDeployerType(j.getCostControlTargetType()));
+                    second.setMaterial(k.getMaterial());
+                    return second;
+                }).collect(Collectors.toList());
+    }
+
+    /**
+     * 任务类型与目标类型是否相等
+     *
+     * @param taskType              任务类型
+     * @param costControlTargetType 成本控制目标类型
+     * @return boolean
+     */
+    private boolean equalsTaskTypeTargetType(TaskTypeEnum taskType, CostControlTargetTypeEnum costControlTargetType) {
+        if (IsUtils.empty(taskType) || IsUtils.empty(costControlTargetType)) {
+            return false;
+        }
+        switch (taskType) {
+            case PRODUCT:
+                return CostControlTargetTypeEnum.PRODUCTION.equals(costControlTargetType);
+            case PROCESS:
+                return CostControlTargetTypeEnum.PROCESS.equals(costControlTargetType);
+            case PACK:
+                return CostControlTargetTypeEnum.PACK.equals(costControlTargetType);
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * 目标类型转部署类型
+     *
+     * @param costControlTargetType 成本控制目标类型
+     * @return {@link DeployerTypeEnum}
+     */
+    private DeployerTypeEnum targetTypeToDeployerType(CostControlTargetTypeEnum costControlTargetType) {
+        if (IsUtils.empty(costControlTargetType)) {
+            return null;
+        }
+        switch (costControlTargetType) {
+            case PRODUCTION:
+                return DeployerTypeEnum.PRODUCT;
+            case PROCESS:
+                return DeployerTypeEnum.PROCESS;
+            case PACK:
+                return DeployerTypeEnum.PACK;
+            case TRANSPORT:
+                return DeployerTypeEnum.TRANSPORT;
+            default:
+                return null;
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public RestResponse<String> add(CostDeployer entity) {
+        if (list(Wrappers.<CostDeployer>lambdaQuery()
+                .eq(CostDeployer::getPlanId, entity.getPlanId())
+                .eq(CostDeployer::getDeployerType, entity.getDeployerType())
+                .eq(CostDeployer::getDeployerLevel, 1)).size() > 0 && entity.getDeployerLevel() == null) {
+            throw new ServiceException("顶层不允许再次部署");
+        }
+        entity.setDeployerLevel(entity.getDeployerLevel() == null ? 1 : entity.getDeployerLevel() + 1);
+        addUpdate(entity);
+        return RestResponse.success();
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void addUpdate(CostDeployer entity) {
+        this.saveOrUpdate(entity);
+        if (IsUtils.notEmptyList(entity.getDeptList())) {
+            entity.getDeptList().stream()/*.filter(i -> !i.getIsIgnore())*/.forEach(dept -> {
+                dept.setDeployerId(entity.getId());
+                dept.setTaskId(entity.getTaskId());
+                dept.setPlanId(entity.getPlanId());
+                dept.setTargetId(entity.getTargetId());
+                deptService.saveOrUpdate(dept);
+                // 修改部署总层级
+                updateDeployerLevelTotal(dept);
+
+                if (IsUtils.notEmptyList(dept.getCentreList())) {
+                    dept.getCentreList().forEach(obj -> {
+                        obj.setDeployerId(entity.getId());
+                        obj.setTaskId(entity.getTaskId());
+                        obj.setPlanId(entity.getPlanId());
+                        obj.setTargetId(entity.getTargetId());
+                        obj.setDeployerDeptId(dept.getId());
+                        centreService.saveOrUpdate(obj);
+                        // 中间表
+                        if (IsUtils.notEmptyList(obj.getCentreSecondList())) {
+                            obj.getCentreSecondList().forEach(deptCentre -> {
+                                deptCentre.setDeployerId(entity.getId());
+                                deptCentre.setTaskId(entity.getTaskId());
+                                deptCentre.setPlanId(entity.getPlanId());
+                                deptCentre.setTargetId(entity.getTargetId());
+                                deptCentre.setCentreId(obj.getId());
+                                deptCentre.setDeployerDeptId(obj.getId());
+                                deptCentre.setDeployerType(obj.getDeployerType());
+                                centreSecondService.saveOrUpdate(deptCentre);
+                                // 主料/辅料/包装
+                                if (IsUtils.notEmptyList(deptCentre.getMaterialPowerList())) {
+                                    deptCentre.getMaterialPowerList().stream().filter(i -> !i.getIsIgnore())
+                                            .filter(i -> !i.getMaterial().equals(MaterialEnum.POWER))
+                                            .forEach(material -> {
+                                                material.setDeployerId(entity.getId());
+                                                material.setTaskId(entity.getTaskId());
+                                                material.setPlanId(entity.getPlanId());
+                                                material.setTargetId(entity.getTargetId());
+                                                material.setCentreId(obj.getId());
+                                                material.setDeployerDeptId(obj.getId());
+                                                material.setCentreSecondId(deptCentre.getId());
+                                                material.setDeployerType(obj.getDeployerType());
+                                                material.setMaterial(deptCentre.getMaterial());
+                                                // 如果单位成本用量-调整值为空，则取标准值
+                                                material.setMaterialUnitUseNumChange(material.getMaterialUnitUseNumChange() == null ? material.getMaterialUnitUseNum() : material.getMaterialUnitUseNumChange());
+                                                // 单位成本控制目标 = 调整值+不含税价格
+                                                material.setUnitCostTarget(ComputeUtil.mul(material.getMaterialUnitUseNumChange(), material.getTargetPrice()));
+                                                itemService.saveOrUpdate(material);
+                                            });
+                                }
+                                // 能源动力中间表
+                                if (IsUtils.notEmptyList(deptCentre.getPowerCentreList())) {
+                                    deptCentre.getPowerCentreList().forEach(powerCentre -> {
+                                        powerCentre.setDeployerId(entity.getId());
+                                        powerCentre.setTaskId(entity.getTaskId());
+                                        powerCentre.setPlanId(entity.getPlanId());
+                                        powerCentre.setTargetId(entity.getTargetId());
+                                        powerCentre.setDeployerDeptId(dept.getId());
+                                        powerCentre.setCentreId(obj.getId());
+                                        powerCentre.setParentId(deptCentre.getId());
+                                        powerCentre.setDeployerType(obj.getDeployerType());
+                                        powerCentre.setMaterial(MaterialEnum.POWER);
+                                        centreSecondService.saveOrUpdate(powerCentre);
+                                        // 能源动力
+                                        if (IsUtils.notEmptyList(powerCentre.getMaterialPowerList())) {
+                                            powerCentre.getMaterialPowerList().stream().filter(i -> !i.getIsIgnore())
+                                                    .filter(i -> i.getMaterial().equals(MaterialEnum.POWER))
+                                                    .forEach(power -> {
+                                                        power.setDeployerId(entity.getId());
+                                                        power.setTaskId(entity.getTaskId());
+                                                        power.setPlanId(entity.getPlanId());
+                                                        power.setTargetId(entity.getTargetId());
+                                                        power.setDeployerDeptId(dept.getId());
+                                                        power.setCentreId(obj.getId());
+                                                        power.setCentreSecondId(powerCentre.getId());
+                                                        power.setDeployerType(obj.getDeployerType());
+                                                        power.setMaterial(MaterialEnum.POWER);
+                                                        power.setPowerType(powerCentre.getPowerType());
+                                                        // 如果单位成本用量-调整值为空，则取标准值
+                                                        power.setMaterialUnitUseNumChange(power.getMaterialUnitUseNumChange() == null ? power.getMaterialUnitUseNum() : power.getMaterialUnitUseNumChange());
+                                                        // 单位成本控制目标 = 调整值+不含税价格
+                                                        power.setUnitCostTarget(ComputeUtil.mul(power.getMaterialUnitUseNumChange(), power.getTargetPrice()));
+                                                        itemService.saveOrUpdate(power);
+                                                    });
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                }
+                if (IsUtils.notEmptyList(dept.getTransportList())) {
+                    dept.getTransportList().stream().filter(tran -> !tran.getIsIgnore()).forEach(transport -> {
+                        transport.setDeployerId(entity.getId());
+                        transport.setTaskId(entity.getTaskId());
+                        transport.setPlanId(entity.getPlanId());
+                        transport.setTargetId(entity.getTargetId());
+                        transport.setDeployerDeptId(dept.getId());
+                        transport.setDeployerType(DeployerTypeEnum.TRANSPORT);
+                        transport.setMaterial(MaterialEnum.TRANSPORT);
+                        // 如果单位成本用量-调整值为空，则取标准值
+                        transport.setMaterialUnitUseNumChange(transport.getMaterialUnitUseNumChange() == null ? transport.getMaterialUnitUseNum() : transport.getMaterialUnitUseNumChange());
+                        // 单位成本控制目标 = 调整值+不含税价格
+                        transport.setUnitCostTarget(ComputeUtil.mul(transport.getMaterialUnitUseNumChange(), transport.getTargetPrice()));
+                        itemService.saveOrUpdate(transport);
+                    });
+                }
+            });
+        }
+    }
+
+    /**
+     * 修改部署总层级
+     *
+     * @param dept 部门
+     */
+    private void updateDeployerLevelTotal(CostDeployerDept dept) {
+        List<CostDeployerDept> deployerDeptList = deptService.lambdaQuery()
+                .select(CostDeployerDept::getId, CostDeployerDept::getDeployerLevelTotal)
+                .eq(CostDeployerDept::getPlanId, dept.getPlanId())
+                .list();
+
+        List<CostDeployerDept> updatedDeployerDeptList = deployerDeptList.stream()
+                .peek(deployerDept -> {
+                    Integer deployerLevelTotal = deployerDept.getDeployerLevelTotal();
+                    if (deployerLevelTotal == null || deployerLevelTotal < dept.getDeployerLevel()) {
+                        deployerDept.setDeployerLevelTotal(dept.getDeployerLevel());
+                    }
+                })
+                .filter(deployerDept -> Objects.equals(deployerDept.getDeployerLevelTotal(), dept.getDeployerLevel()))
+                .collect(Collectors.toList());
+
+        if (!updatedDeployerDeptList.isEmpty()) {
+            deptService.updateBatchById(updatedDeployerDeptList);
+        }
+    }
+
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public RestResponse<String> updateA(CostDeployer entity) {
+        delAll(entity.getId());
+        addUpdate(entity);
+        // 通知观察者
+        applicationEventPublisher.publishEvent(new CostAllotObserve(entity));
+        return RestResponse.success();
+    }
+
+    private void delAll(String deployerId) {
+        centreService.remove(Wrappers.<CostDeployerCentre>lambdaQuery()
+                .eq(CostDeployerCentre::getDeployerId, deployerId));
+        deptService.remove(Wrappers.<CostDeployerDept>lambdaQuery()
+                .eq(CostDeployerDept::getDeployerId, deployerId));
+        centreSecondService.remove(Wrappers.<CostDeployerCentreSecond>lambdaQuery()
+                .eq(CostDeployerCentreSecond::getDeployerId, deployerId));
+        itemService.remove(Wrappers.<CostDeployerMaterialPowerTransport>lambdaQuery()
+                .eq(CostDeployerMaterialPowerTransport::getDeployerId, deployerId));
+    }
+
+    @Override
+    public RestResponse<CostDeployer> getDetail(String id) {
+        CostDeployer entity = this.getById(id);
+        if (IsUtils.empty(entity)) {
+            return RestResponse.error("无数据");
+        }
+        //? 查询所有数据
+        List<CostDeployerCentre> objList = centreService.list(Wrappers.<CostDeployerCentre>lambdaQuery()
+                .eq(CostDeployerCentre::getDeployerId, id));
+        List<CostDeployerDept> deptList = deptService.list(Wrappers.<CostDeployerDept>lambdaQuery()
+                .eq(CostDeployerDept::getDeployerId, id));
+        List<CostDeployerCentreSecond> centreSecondList = centreSecondService.list(Wrappers.<CostDeployerCentreSecond>lambdaQuery()
+                .eq(CostDeployerCentreSecond::getDeployerId, id));
+        List<CostDeployerMaterialPowerTransport> materialPowerTransportList = itemService.list(Wrappers.<CostDeployerMaterialPowerTransport>lambdaQuery()
+                .eq(CostDeployerMaterialPowerTransport::getDeployerId, id));
+
+//        entity.setDeptList(deptService.listByDeployerId());
+
+        // fixed 以下为返回全部
+        if (IsUtils.notEmptyList(deptList)) {
+            deptList.forEach(dept -> {
+                dept.setCentreList(objList.stream().filter(i -> i.getDeployerDeptId().equals(dept.getId()))
+                        .collect(Collectors.toList()));
+                dept.setTransportList(materialPowerTransportList.stream().filter(i -> i.getDeployerDeptId()
+                                .equals(dept.getId()) && i.getMaterial()
+                                .equals(MaterialEnum.TRANSPORT))
+                        .collect(Collectors.toList()));
+                //? 第一层中间表
+                if (IsUtils.notEmptyList(dept.getCentreList())) {
+                    dept.getCentreList().forEach(obj -> {
+                        obj.setCentreSecondList(centreSecondList.stream().filter(i -> i.getParentId() == null)
+                                .filter(i -> i.getCentreId().equals(obj.getId()))
+                                .collect(Collectors.toList()));
+
+                        //? 第二层中间表
+                        if (IsUtils.notEmptyList(obj.getCentreSecondList())) {
+                            //? 主料/辅料/包装
+                            obj.getCentreSecondList().forEach(centreSecond -> {
+                                centreSecond.setMaterialPowerList(materialPowerTransportList.stream()
+                                        .filter(i -> i.getCentreSecondId()
+                                                .equals(centreSecond.getId()) && !i.getMaterial()
+                                                .equals(MaterialEnum.POWER))
+                                        .collect(Collectors.toList()));
+                                //? 能源动力中间表
+                                centreSecond.setPowerCentreList(centreSecondList.stream()
+                                        .filter(i -> i.getParentId() != null)
+                                        .filter(i -> i.getParentId()
+                                                .equals(centreSecond.getId()))
+                                        .collect(Collectors.toList()));
+                                //? 能源动力
+                                if (IsUtils.notEmptyList(centreSecond.getPowerCentreList())) {
+                                    centreSecond.getPowerCentreList()
+                                            .forEach(powerCentre -> powerCentre.setMaterialPowerList(materialPowerTransportList.stream()
+                                                    .filter(i -> i.getCentreSecondId()
+                                                            .equals(powerCentre.getId()) && i.getMaterial()
+                                                            .equals(MaterialEnum.POWER))
+                                                    .collect(Collectors.toList())));
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+            entity.setDeptList(deptList);
+        }
+        return RestResponse.success(entity);
+    }
+
+    @Override
+    public RestResponse<String> updateState(BaseCondition condition) {
+        SysAction action = condition.getAction();
+        if (action == null) {
+            throw new ServiceException("操作类型不能为空");
+        }
+        if (SysAction.DELETE.equals(action)) {
+            this.removeById(condition.getId());
+        } else {
+            this.lambdaUpdate()
+                    .set(CostDeployer::getAuditState, WebAuditUtil.getAuditState())
+                    .eq(CostDeployer::getId, condition.getId()).update();
+        }
+        return RestResponse.success();
+    }
+
+    @Override
+    public RestResponse<String> delete(String planId) {
+        // 递归删除
+        this.lambdaUpdate()
+                .eq(CostDeployer::getPlanId, planId).remove();
+        deptService.remove(Wrappers.<CostDeployerDept>lambdaQuery()
+                .eq(CostDeployerDept::getPlanId, planId));
+        centreService.remove(Wrappers.<CostDeployerCentre>lambdaQuery()
+                .eq(CostDeployerCentre::getPlanId, planId));
+        centreSecondService.remove(Wrappers.<CostDeployerCentreSecond>lambdaQuery()
+                .eq(CostDeployerCentreSecond::getPlanId, planId));
+        itemService.remove(Wrappers.<CostDeployerMaterialPowerTransport>lambdaQuery()
+                .eq(CostDeployerMaterialPowerTransport::getPlanId, planId));
+        return RestResponse.success();
+    }
+
+    @Override
+    public RestResponse<CostDeployerDept> getAddByTargetId(String targetId, String taskDeptId, Integer type) {
+        ProduceTaskDept taskDept = taskDeptService.getById(taskDeptId);
+        if (IsUtils.empty(taskDept)) {
+            return RestResponse.error("无数据");
+        }
+        CostDeployerDept dept = new CostDeployerDept();
+        ProdCostTarget target = targetService.getDetail(targetId).getData();
+        if (IsUtils.empty(target)) {
+            return RestResponse.error("无数据");
+        }
+        if (type == 2) {
+            // 运输时
+            dept.setTransportList(setTransportList(target));
+        } else {
+            // 生产时
+            dept.setCentreList(setCentreList(target, taskDept));
+        }
+        return RestResponse.success(dept);
+    }
+
+    /**
+     * 形成部署中间表List
+     *
+     * @param target   目标
+     * @param taskDept 任务部门
+     * @return {@link List}<{@link CostDeployerCentre}>
+     */
+    private List<CostDeployerCentre> setCentreList(ProdCostTarget target, ProduceTaskDept taskDept) {
+        List<ProdCostTargetCentre> centreList = target.getCentreList().stream()
+                .filter(i -> this.isEqualsTaskType(i.getCostControlTargetType(), taskDept.getTaskType()))
+                .collect(Collectors.toList());
+
+        List<CostDeployerCentre> deployerCentreList = new ArrayList<>();
+        for (ProdCostTargetCentre centre : centreList) {
+            CostDeployerCentre deployerCentre = new CostDeployerCentre();
+            // 成本控制目标
+            deployerCentre.setDeployerType(targetTypeToDeployerType(centre.getCostControlTargetType()));
+            // 控制目标
+            deployerCentre.setCostControlTarget(centre.getProductionControlTarget());
+            // 二级中间表
+            deployerCentre.setCentreSecondList(setCentreSecondList(centre));
+            deployerCentreList.add(deployerCentre);
+        }
+        return deployerCentreList;
+    }
+
+    /**
+     * 形成部署中间表第二层List
+     *
+     * @return {@link List}<{@link CostDeployerCentreSecond}>
+     */
+    private List<CostDeployerCentreSecond> setCentreSecondList(ProdCostTargetCentre centre) {
+        if (IsUtils.notEmptyList(centre.getCentreTwoList())) {
+            List<CostDeployerCentreSecond> deployerCentreSecondList = new ArrayList<>();
+            for (ProdCostTargetCentreTwo centreTwo : centre.getCentreTwoList()) {
+                // 计时计件工资不返回
+                if (centreTwo.getMaterial().equals(MaterialEnum.PIECE) || centreTwo.getMaterial()
+                        .equals(MaterialEnum.TIME)) {
+                    continue;
+                }
+                CostDeployerCentreSecond centreSecond = new CostDeployerCentreSecond();
+                // 主料辅料能源动力包装明细
+                centreSecond.setMaterial(centreTwo.getMaterial());
+                // 主料/辅料/包装
+                centreSecond.setMaterialPowerList(setItemList(centreSecond.getMaterial(), centreTwo));
+                // 能源动力
+                centreSecond.setPowerCentreList(setPowerList(centreTwo));
+                // (运输)成本控制目标
+                centreSecond.setCostControlTarget(centreTwo.getProductionControlTarget());
+                // 控制目标id
+                centreSecond.setTargetId(centreTwo.getTargetId());
+                deployerCentreSecondList.add(centreSecond);
+            }
+            return deployerCentreSecondList;
+        }
+        return null;
+    }
+
+    /**
+     * 形成部署运输List
+     *
+     * @param target 目标
+     * @return {@link List}<{@link CostDeployerMaterialPowerTransport}>
+     */
+    private List<CostDeployerMaterialPowerTransport> setTransportList(ProdCostTarget target) {
+        ProdCostTargetCentre centre = target.getCentreList().stream().filter(i -> i.getCostControlTargetType()
+                        .equals(CostControlTargetTypeEnum.TRANSPORT))
+                .findFirst().orElse(null);
+        if (IsUtils.notEmpty(centre)) {
+            List<CostDeployerMaterialPowerTransport> list = new ArrayList<>();
+            // List不为空
+            if (centre != null && IsUtils.notEmptyList(centre.getItemList())) {
+                for (ProdCostTargetItem item : centre.getItemList()) {
+                    CostDeployerMaterialPowerTransport transport = new CostDeployerMaterialPowerTransport();
+                    // 主料辅料能源动力包装明细
+                    transport.setMaterial(MaterialEnum.TRANSPORT);
+                    // 部署类别:1-制造成本控制目标部署2-加工成本控制目标部署3-包装成本控制目标部署4-运输成本控制目标部署
+                    transport.setDeployerType(DeployerTypeEnum.TRANSPORT);
+                    // 成本控制项目名称
+                    transport.setCostProjectName(item.getControlProjectName());
+                    // 物资名称 | 规格 | 运输对象
+                    transport.setMaterialName(item.getMaterialTypeName());
+                    // 物资名称 | 规格 | 运输对象
+                    transport.setMaterialType(item.getMaterialTypeName());
+                    // 单位产品用量-标准值  | 产品成本控制目标(运输)
+                    transport.setMaterialUnitUseNum(item.getUnitProductUseNum());
+                    // 平均运价控制目标
+                    transport.setUnitCostTarget(item.getExcludeFareControlTarget());
+                    // 是否目标激励
+                    transport.setIsTargetImpel(item.getIsEncourage());
+                    // 是否部署下级
+                    transport.setIsDeployerLow(false);
+                    // 是否忽略
+                    transport.setIsIgnore(false);
+                    // 目标控制成本项目id
+                    transport.setTargetCostControlProjectId(item.getId());
+                    // 排序
+                    transport.setSort(item.getSort());
+                    list.add(transport);
+                }
+            }
+            return list;
+        }
+        return null;
+    }
+
+    private boolean isEqualsTaskType(CostControlTargetTypeEnum costControlTargetType, String taskType) {
+        String[] split = StringUtils.split(taskType, ",");
+        // 将split中"生产"替换成"制造"
+        for (int i = 0; i < split.length; i++) {
+            if (split[i].equals("生产任务")) {
+                split[i] = "制造任务";
+            }
+        }
+        String label = costControlTargetType.getLabel();
+        String sub = label.substring(0, 2);
+        // 循环taskType,如果有一个字符串包含sub就返回true
+        return Arrays.stream(split).anyMatch(i -> i.contains(sub));
+    }
+
+    private List<CostDeployerCentreSecond> setPowerList(ProdCostTargetCentreTwo j) {
+        if (IsUtils.notEmptyList(j.getCentrePowerList())) {
+            return j.getCentrePowerList().stream()
+                    .map(k -> {
+                        CostDeployerCentreSecond centreSecond = new CostDeployerCentreSecond();
+                        centreSecond.setMaterialPowerList(k.getItemList().stream()
+                                .map(l -> {
+                                    CostDeployerMaterialPowerTransport power = new CostDeployerMaterialPowerTransport();
+                                    // 主料辅料能源动力包装明细
+                                    power.setMaterial(MaterialEnum.POWER);
+                                    // 成本控制项目名称
+                                    power.setCostProjectName(l.getControlProjectName());
+                                    // 能源动力类别
+                                    power.setPowerType(l.getPowerType());
+                                    // 物资类别 | 能源动力名称
+                                    power.setMaterialType(l.getMaterialTypeName());
+                                    // 物资名称 | 规格 | 运输对象
+                                    power.setMaterialName(l.getMaterialTypeName());
+                                    // 单位产品用量-标准值  | 产品成本控制目标(运输)
+                                    power.setMaterialUnitUseNum(l.getUnitProductUseNum());
+                                    // 不含税价格(对应目标价格)
+                                    power.setTargetPrice(l.getMaterialTargetPrice());
+                                    // 是否目标激励
+                                    power.setIsTargetImpel(l.getIsEncourage());
+                                    // 是否部署下级
+                                    power.setIsDeployerLow(false);
+                                    // 是否忽略
+                                    power.setIsIgnore(false);
+                                    // 目标控制成本项目id
+                                    power.setTargetCostControlProjectId(l.getId());
+                                    // 排序
+                                    power.setSort(l.getSort());
+                                    // 单位
+                                    power.setMaterialUnit(l.getMaterialUnit());
+                                    return power;
+                                }).collect(Collectors.toList()));
+                        // 成本控制目标
+                        centreSecond.setCostControlTarget(k.getProductionControlTarget());
+                        // 控制目标id
+                        centreSecond.setTargetId(k.getTargetId());
+                        // 中间表id
+                        centreSecond.setCentreId(k.getCentreId());
+                        // 能源类型(例:水电天然气)
+                        centreSecond.setPowerType(k.getPowerType());
+                        // 主料辅料能源动力包装明细
+                        centreSecond.setMaterial(MaterialEnum.POWER);
+                        return centreSecond;
+                    }).collect(Collectors.toList());
+        }
+        return null;
+    }
+
+    /**
+     * 将主料/辅料/包装扔给部署
+     *
+     * @param material 材料
+     * @param j        j
+     * @return {@link List}<{@link CostDeployerMaterialPowerTransport}>
+     */
+    private List<CostDeployerMaterialPowerTransport> setItemList(MaterialEnum material, ProdCostTargetCentreTwo j) {
+        if (material.equals(MaterialEnum.MAIN)) {
+            return j.getItemList().stream().filter(k -> MaterialEnum.MAIN.equals(k.getMaterial()))
+                    .map(CostDeployerServiceImpl::getCostDeployerItem).collect(Collectors.toList());
+        } else if (material.equals(MaterialEnum.AUX)) {
+            return j.getItemList().stream().filter(k -> MaterialEnum.AUX.equals(k.getMaterial()))
+                    .map(CostDeployerServiceImpl::getCostDeployerItem).collect(Collectors.toList());
+        } else if (material.equals(MaterialEnum.PACK)) {
+            return j.getItemList().stream().filter(k -> MaterialEnum.PACK.equals(k.getMaterial()))
+                    .map(CostDeployerServiceImpl::getCostDeployerItem).collect(Collectors.toList());
+        } else if (material.equals(MaterialEnum.MATERIAL)) {
+            return j.getItemList().stream().filter(k -> MaterialEnum.MATERIAL.equals(k.getMaterial()))
+                    .map(CostDeployerServiceImpl::getCostDeployerItem).collect(Collectors.toList());
+        }
+        return null;
+    }
+
+    @Override
+    public RestResponse<CostDeployerDeptDetailDTO> deptDetail(String deployerDeptId) {
+        CostDeployerDept deployerDept = deptService.getById(deployerDeptId);
+        if (IsUtils.empty(deployerDept)) {
+            return RestResponse.error("无数据");
+        }
+        CostDeployer deployer = this.getDetail(deployerDept.getDeployerId()).getData();
+        CostDeployerDeptDetailDTO dto = new CostDeployerDeptDetailDTO();
+        CopyUtil.copy(deployer, dto);
+        CopyUtil.copy(deployerDept, dto);
+
+        // 获取子列表
+        List<CostDeployerDept> deptList = deptService.list(Wrappers.<CostDeployerDept>lambdaQuery()
+                .in(CostDeployerDept::getParentId, deployer.getDeptList()
+                        .stream()
+                        .map(CostDeployerDept::getId)
+                        .collect(Collectors.toList()))
+                .or()
+                .eq(CostDeployerDept::getParentId, deployerDeptId));
+        deployer.getDeptList().forEach(i -> i.setIsAlreadyDeployer(IsUtils.notEmptyList(deptList.stream()
+                .filter(j -> j.getParentId()
+                        .equals(i.getId()))
+                .collect(Collectors.toList()))));
+
+        // 本级部门详情
+        dto.setThisLevelDeployerDetail(deployer.getDeptList().stream().filter(i -> i.getId().equals(deployerDeptId))
+                .findFirst().orElse(null));
+        // 下级部门详情
+        dto.setNextLevelDeployerDetailList(deptService.lambdaQuery()
+                .eq(CostDeployerDept::getParentId, deployerDeptId)
+                .list());
+        return RestResponse.success(dto);
+    }
+
+    @Override
+    public RestResponse<CostDeployerDetailDTO> getDetailSummaryById(String planId) {
+        // 1 先查询所有部署
+        List<CostDeployer> deployerList = lambdaQuery().eq(CostDeployer::getPlanId, planId)
+                .list();
+        if (IsUtils.emptyList(deployerList)) {
+            return RestResponse.empty();
+        }
+
+        CostDeployer firstDeployer = deployerList.stream().filter(i -> i.getDeployerLevel() == 1).findFirst()
+                .orElse(null);
+        if (firstDeployer == null) {
+            return RestResponse.error("无数据");
+        }
+
+        CostDeployerDetailDTO vo = new CostDeployerDetailDTO();
+        vo.setPlanId(firstDeployer.getPlanId());
+        vo.setPlanOdd(firstDeployer.getPlanOdd());
+        vo.setProductName(firstDeployer.getProductName());
+        vo.setModelName(firstDeployer.getModelName());
+        // 控制目标
+        vo.setCostControlTarget(firstDeployer.getCostControlTarget());
+        // 部署目标
+        vo.setCostControlDiff(firstDeployer.getCostControlDiff());
+        // 差异
+        vo.setTargetCostDiff(ComputeUtil.sub(vo.getCostControlTarget(), vo.getCostControlDiff()));
+        // 状态
+        vo.setIsAnalyseState(isAnalyseState(firstDeployer.getCostControlDiff()));
+
+        // 获取所有部署部门
+        List<String> deployerIds = EntityUtils.getIds(deployerList);
+        List<CostDeployerDept> deployerDeptList = deptService.listByDeployerIds(deployerIds);
+
+        // 制造 | 加工Map
+        Map<String, CostDeployerDetailDTO2> oneMap = new HashMap<>();
+        List<CostDeployer> prodDeployerList = EntityUtils.filter(deployerList, i -> i.getDeployerType()
+                .equals(CostDeployerTypeEnum.PROD));
+        List<CostDeployer> transportDeployerList = EntityUtils.filter(deployerList, i -> i.getDeployerType()
+                .equals(CostDeployerTypeEnum.TRANSPORT));
+        oneMap.put("制造加工成本部署", getProdTransportDeployer(prodDeployerList, getDeployerDeptList(deployerDeptList, prodDeployerList)));
+        oneMap.put("运输成本部署", getProdTransportDeployer(transportDeployerList, getDeployerDeptList(deployerDeptList, transportDeployerList)));
+
+        vo.setOneMap(oneMap);
+
+        return RestResponse.success(vo);
+    }
+
+    /**
+     * 得到部署部门列表
+     *
+     * @param deployerDeptList 全部部署部门
+     * @param prodDeployerList 制造 | 运输 部署
+     * @return {@link List}<{@link CostDeployerDept}>
+     */
+    private List<CostDeployerDept> getDeployerDeptList(List<CostDeployerDept> deployerDeptList, List<CostDeployer> prodDeployerList) {
+        return deployerDeptList.stream().filter(i -> prodDeployerList.stream().anyMatch(j -> j.getId()
+                        .equals(i.getDeployerId())))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 制造 | 运输成本目标部署
+     *
+     * @param deployerList     部署人员名单
+     * @param deployerDeptList 部署人员部门列表
+     * @return {@link CostDeployerDetailDTO2}
+     */
+    @NotNull
+    private CostDeployerDetailDTO2 getProdTransportDeployer(List<CostDeployer> deployerList, List<CostDeployerDept> deployerDeptList) {
+        CostDeployer firstDeployer = deployerList.stream().filter(i -> i.getDeployerLevel() == 1).findFirst()
+                .orElse(null);
+        if (firstDeployer == null) {
+            return new CostDeployerDetailDTO2();
+        }
+        CostDeployerDetailDTO2 vo = new CostDeployerDetailDTO2();
+        vo.setDeptList(buildDeptTree(deployerDeptList));
+        // 成本控制目标
+        vo.setCostControlTarget(firstDeployer.getCostControlTarget());
+        // 成本部署目标
+        vo.setCostDeployerTarget(firstDeployer.getCostControlDiff());
+        // 目标成本差异
+        vo.setTargetCostDiff(ComputeUtil.sub(vo.getCostControlTarget(), vo.getCostDeployerTarget()));
+        // 状态:正常超标
+        vo.setIsAnalyseState(isAnalyseState(vo.getTargetCostDiff()));
+        vo.setAuditState(firstDeployer.getAuditState());
+        return vo;
+    }
+
+    /**
+     * 构建部门树
+     *
+     * @param deployerDeptList 部署人员部门列表
+     * @return {@link List}<{@link CostDeployerDept}>
+     */
+    private List<CostDeployerDept> buildDeptTree(List<CostDeployerDept> deployerDeptList) {
+        return TreeUtils.createNodeDetail(deployerDeptList, "1", CostDeployerDept::getId, CostDeployerDept::getParentId, CostDeployerDept::getChildren);
+    }
+
+
+    @Override
+    public CostDeployer getDetailByPlanId(String planId) {
+        CostDeployer one = this.lambdaQuery()
+                .eq(CostDeployer::getPlanId, planId).last("limit 1")
+                .one();
+//        if (IsUtils.notEmpty(one)) {
+//            return this.getDetail(one.getId()).getData();
+//        }
+        return one;
+    }
+
+    @Override
+    public List<MesWarehouseApplicantMaterial> listByDeptNameAndMaterialId(String deptName, String materialId) {
+        // 通过部门查询已经部署审核通过的部门
+        List<CostDeployerDept> deployerDeptList = deptService.listOnAuditByDeptName(deptName);
+        if (IsUtils.emptyList(deployerDeptList)) {
+            return null;
+        }
+        List<String> deployerDeptIds = EntityUtils.getIds(deployerDeptList);
+        // 查询所有部署信息List
+        List<CostDeployer> deployerList = this.listByIds(EntityUtils.toSet(deployerDeptList, CostDeployerDept::getDeployerId));
+        // 查询所有部署物料信息List
+        List<CostDeployerMaterialPowerTransport> itemList = itemService.lambdaQuery()
+                .in(CostDeployerMaterialPowerTransport::getDeployerDeptId, deployerDeptIds)
+                .list();
+
+        List<MesWarehouseApplicantMaterial> voList = new ArrayList<>();
+        for (CostDeployer deployer : deployerList) {
+            MesWarehouseApplicantMaterial vo = new MesWarehouseApplicantMaterial();
+            vo.setMaterialUse(deployer.getPlanOdd() + deployer.getProductName());
+            vo.setCostExpenses(CostExpensesEnum.COST);
+            vo.setPlanOdd(deployer.getPlanOdd());
+            vo.setProductName(deployer.getProductName());
+            vo.setStartEndDate(deployer.getStartDate() + " 至 " + deployer.getEndDate());
+            vo.setChildren(itemList.stream().filter(i -> i.getDeployerId().equals(deployer.getId()))
+                    .map(i -> {
+                        // 要拿每一个控制项目id和物资id去查材料计划中有没有相对应的物资
+                        if (!materialPlanStockNewService.isExistMaterial(i.getTargetId(), materialId)) {
+                            return null;
+                        }
+                        MesWarehouseApplicantMaterial child = new MesWarehouseApplicantMaterial();
+                        child.setDeployerItemId(i.getId());
+                        child.setTargetId(i.getTargetCostControlProjectId());
+                        child.setTargetName(i.getCostProjectName());
+                        child.setControlTarget(i.getUnitCostTarget());
+                        // TODO: 2023/4/23 实际发生  当前部门收益
+                        return child;
+                    }).collect(Collectors.toList()));
+            voList.add(vo);
+        }
+        return voList;
+    }
+
+    @Override
+    public RestResponse<CostDeployerDetailTypeDTO> getSummaryType(String planId) {
+        List<String> ids = lambdaQuery().select(CostDeployer::getId)
+                .eq(CostDeployer::getPlanId, planId)
+                .list().stream()
+                .map(CostDeployer::getId)
+                .collect(Collectors.toList());
+        if (IsUtils.emptyList(ids)) {
+            return RestResponse.success();
+        }
+        // 中间表1
+        List<CostDeployerCentre> centreList = centreService.listByDeployerIds(ids);
+        // 中间表2
+        List<CostDeployerCentreSecond> centreSecondList = centreSecondService.listByDeployerIds(ids);
+
+        CostDeployerDetailTypeDTO result = new CostDeployerDetailTypeDTO();
+
+        Map<DeployerTypeEnum, CostDeployerDetailTypeDTO> resultMap = new HashMap<>();
+
+
+        for (Map.Entry<DeployerTypeEnum, List<CostDeployerCentre>> entry : EntityUtils.groupBy(centreList, CostDeployerCentre::getDeployerType)
+                .entrySet()) {
+            if (IsUtils.emptyList(entry.getValue())) {
+                continue;
+            }
+            CostDeployerDetailTypeDTO vo = new CostDeployerDetailTypeDTO();
+            // 汇总信息
+            vo.setCost(getCost(entry.getValue()));
+            // 主料辅料能源动力列表
+            vo.setCentreList(this.getCentreList(entry.getValue(), centreSecondList));
+            // 能源动力明细列表
+            vo.setPowerList(this.getPowerList(centreSecondList));
+
+            resultMap.put(entry.getKey(), vo);
+        }
+        result.setResultMap(resultMap);
+        this.getTotal(result, resultMap);
+
+        return RestResponse.success(result);
+    }
+
+    @Override
+    public RestResponse<CostDeployer> detailUpdateSelf(String deployerDeptId) {
+        CostDeployerDept deployerDept = deptService.getDetail(deployerDeptId);
+        if (IsUtils.empty(deployerDept)) {
+            return RestResponse.error("无数据");
+        }
+        CostDeployer entity = getById(deployerDept.getDeployerId());
+        entity.setDeptList(Collections.singletonList(deployerDept));
+        return RestResponse.success(entity);
+    }
+
+    /**
+     * 得到总的汇总信息
+     *
+     * @param result    结果
+     * @param resultMap 结果图
+     */
+    private void getTotal(CostDeployerDetailTypeDTO result, Map<DeployerTypeEnum, CostDeployerDetailTypeDTO> resultMap) {
+        result.setControlTarget(BigDecimal.ZERO);
+        result.setDeployerTarget(BigDecimal.ZERO);
+        result.setCostDiff(BigDecimal.ZERO);
+
+        for (Map.Entry<DeployerTypeEnum, CostDeployerDetailTypeDTO> entry : resultMap.entrySet()) {
+            CostDeployerDetailTypeDTO value = entry.getValue();
+            CostDeployerDetailTypeDTO2 cost = value.getCost();
+            if (IsUtils.notEmpty(cost)) {
+                result.setControlTarget(result.getControlTarget().add(cost.getControlTarget()));
+                result.setDeployerTarget(result.getDeployerTarget().add(cost.getDeployerTarget()));
+                result.setCostDiff(result.getCostDiff().add(cost.getCostDiff()));
+            }
+        }
+        result.setState(isAnalyseState(result.getCostDiff()));
+    }
+
+    /**
+     * 能源动力明细列表
+     *
+     * @param centreSecondList 中间表第二个列表
+     * @return {@link List}<{@link CostDeployerDetailTypeDTO2}>
+     */
+    private List<CostDeployerDetailTypeDTO2> getPowerList(List<CostDeployerCentreSecond> centreSecondList) {
+        List<CostDeployerDetailTypeDTO2> voList = new ArrayList<>();
+        for (Map.Entry<String, List<CostDeployerCentreSecond>> entry : EntityUtils.groupBy(EntityUtils.filter(centreSecondList, i -> i.getParentId() != null), CostDeployerCentreSecond::getPowerType)
+                .entrySet()) {
+            CostDeployerDetailTypeDTO2 vo = new CostDeployerDetailTypeDTO2();
+            vo.setAttrType(entry.getKey());
+            vo.setControlTarget(ComputeUtil.sum(entry.getValue(), CostDeployerCentreSecond::getCostControlTarget));
+            vo.setDeployerTarget(ComputeUtil.sum(entry.getValue(), CostDeployerCentreSecond::getCostControlDiff));
+            vo.setCostDiff(ComputeUtil.sub(vo.getControlTarget(), vo.getDeployerTarget()));
+            vo.setState(isAnalyseState(vo.getCostDiff()));
+            voList.add(vo);
+        }
+        return voList;
+    }
+
+    /**
+     * 主料辅料能源动力列表
+     *
+     * @param value            价值
+     * @param centreSecondList 中间表第二个列表
+     * @return {@link List}<{@link CostDeployerDetailTypeDTO2}>
+     */
+    private List<CostDeployerDetailTypeDTO2> getCentreList(List<CostDeployerCentre> value, List<CostDeployerCentreSecond> centreSecondList) {
+        List<CostDeployerDetailTypeDTO2> voList = new ArrayList<>();
+        for (Map.Entry<MaterialEnum, List<CostDeployerCentreSecond>> entry : EntityUtils.groupBy(EntityUtils.filter(centreSecondList, i -> i.getParentId() == null), CostDeployerCentreSecond::getMaterial)
+                .entrySet()) {
+            CostDeployerDetailTypeDTO2 vo = new CostDeployerDetailTypeDTO2();
+            vo.setAttrType(entry.getKey().getLabel());
+            vo.setControlTarget(ComputeUtil.sum(value, CostDeployerCentre::getCostControlDiff));
+            vo.setDeployerTarget(ComputeUtil.sum(entry.getValue(), CostDeployerCentreSecond::getCostControlDiff));
+            vo.setCostDiff(ComputeUtil.sub(vo.getControlTarget(), vo.getDeployerTarget()));
+            vo.setState(isAnalyseState(vo.getCostDiff()));
+            voList.add(vo);
+        }
+        return voList;
+    }
+
+    /**
+     * 汇总信息
+     *
+     * @param value 价值
+     * @return {@link CostDeployerDetailTypeDTO2}
+     */
+    private CostDeployerDetailTypeDTO2 getCost(List<CostDeployerCentre> value) {
+        CostDeployerDetailTypeDTO2 vo = new CostDeployerDetailTypeDTO2();
+        vo.setAttrType(value.get(0).getDeployerType().toString());
+        vo.setControlTarget(this.getCostControlTarget(value));
+        vo.setDeployerTarget(ComputeUtil.sum(value, CostDeployerCentre::getCostControlDiff));
+        vo.setCostDiff(ComputeUtil.sub(vo.getControlTarget(), vo.getDeployerTarget()));
+        vo.setState(isAnalyseState(vo.getCostDiff()));
+        return vo;
+    }
+
+    /**
+     * 获取一级部署的控制目标
+     *
+     * @param value 价值
+     * @return {@link BigDecimal}
+     */
+    private BigDecimal getCostControlTarget(List<CostDeployerCentre> value) {
+        return baseMapper.getCostControlTarget(EntityUtils.toSet(value, CostDeployerCentre::getDeployerId), value.get(0)
+                .getDeployerType());
+    }
+
+
+    /**
+     * 判断是否超标
+     *
+     * @param bigDecimal 数据
+     * @return {@link MaterialBenchmarkState}
+     */
+    private String isAnalyseState(BigDecimal bigDecimal) {
+        if (IsUtils.empty(bigDecimal)) {
+            return MaterialBenchmarkState.NORMAL.getLabel();
+        }
+        if (bigDecimal.compareTo(BigDecimal.ZERO) >= 0) {
+            return MaterialBenchmarkState.NORMAL.getLabel();
+        }
+        return MaterialBenchmarkState.OVER.getLabel();
+    }
+}
