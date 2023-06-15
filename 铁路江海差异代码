@@ -1,0 +1,487 @@
+package com.yl.prod.service.contract.purchase.material.diff;
+
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.google.common.collect.Lists;
+import com.yl.MES.service.warehouse.material.into.IntoWarehouseEvent;
+import com.yl.common.domain.RestResponse;
+import com.yl.common.entity.contract.common.diff.ProdContractMaterialDiff;
+import com.yl.common.entity.logistics.shipping.road.MesLogisticsShippingSend;
+import com.yl.common.entity.logistics.shipping.road.MesLogisticsShippingSendCar;
+import com.yl.common.entity.logistics.shipping.road.MesLogisticsShippingSendMaterial;
+import com.yl.common.entity.warehouse.material.into.MESWarehouseMaterialInto;
+import com.yl.common.enums.CodeRule;
+import com.yl.common.enums.ContractDiffTypeEnum;
+import com.yl.common.enums.TransportModeEnum;
+import com.yl.common.enums.contract.ContractTypeEnum;
+import com.yl.common.utils.*;
+import com.yl.prod.mapper.contract.purchase.material.diff.ProdContractDiffMapper;
+import com.yl.prod.mapper.contract.purchase.material.diff.ProdContractMaterialPurchaseDiffMapper;
+import com.yl.prod.service.contract.shipping.material.admin.ProdContractMaterialShippingAitemService;
+import com.yl.prod.service.contract.shipping.material.admin.ProdContractMaterialShippingService;
+import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.Resource;
+import java.math.BigDecimal;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import static com.yl.common.utils.IdUtils.getId;
+
+/**
+ * 合同管理-物资采购合同-成本差异(需方自提-铁路)
+ *
+ * <p>
+ * 每次到货 装车 都新增数据 而不是修改原数据,最后汇总就行
+ * </p>
+ *
+ * @author zhy
+ * @since 2023-05-22 15:29:52
+ */
+
+@Service
+@Slf4j
+public class ProdContractMaterialPurchaseDiffSelfRailwayService extends ServiceImpl<ProdContractDiffMapper, ProdContractMaterialDiff> {
+	@Resource
+	private ProdContractMaterialShippingAitemService shippingAitemService;
+	@Resource
+	private ProdContractMaterialShippingService shippingService;
+	@Resource
+	private ProdContractMaterialPurchaseDiffMapper diffMapper;
+	private ProdContractMaterialDiff result;
+
+	public RestResponse<ProdContractMaterialDiff> getDetail(String contractMaterialId,
+															ContractDiffTypeEnum diffTypeEnum) {
+		ProdContractMaterialDiff result = new ProdContractMaterialDiff();
+		// 运输差异通过 发站短运/铁路运输/到站短运 分出来
+		if (ContractDiffTypeEnum.TRANSPORT.equals(diffTypeEnum)) {
+			List<ProdContractMaterialDiff> transportList = diffMapper.listByContractMaterialIdAndDiffTypeAndStatisticsDate(contractMaterialId, diffTypeEnum);
+			if (IsUtils.emptyList(transportList)) {
+				return RestResponse.success();
+			}
+			result.setTypeStr("铁路运输");
+			result.setCostDiff(ComputeUtil.sum(transportList, ProdContractMaterialDiff::getCostDiff));
+			result.setUnitMaterialCostDiff(ComputeUtil.sub(result.getCostDiff(), ComputeUtil.sum(transportList, ProdContractMaterialDiff::getIntoWarehouseNum)));
+			result.setChildren(handleShort(transportList));
+			return RestResponse.success(result);
+		} else if (ContractDiffTypeEnum.NUM.equals(diffTypeEnum)) {
+			// 数量差异
+			List<ProdContractMaterialDiff> numList = diffMapper.listGroupBusinessOdd(contractMaterialId, diffTypeEnum);
+			if (IsUtils.emptyList(numList)) {
+				return RestResponse.success();
+			}
+			result.setTypeStr("铁路运输");
+			result.setCostDiff(ComputeUtil.sum(numList, ProdContractMaterialDiff::getCostDiff));
+			result.setLossNum(ComputeUtil.sum(numList, ProdContractMaterialDiff::getLossNum));
+			result.setUnitMaterialCostDiff(ComputeUtil.div(result.getCostDiff(), ComputeUtil.sum(numList, ProdContractMaterialDiff::getIntoWarehouseNum)));
+			result.setChildrenMap(handleNum(numList));
+		} else if (ContractDiffTypeEnum.CLOSE.equals(diffTypeEnum)) {
+			// 结算差异
+			List<ProdContractMaterialDiff> clostList = diffMapper.listCloseDiff(contractMaterialId, diffTypeEnum);
+			if (IsUtils.emptyList(clostList)) {
+				return RestResponse.success();
+			}
+			result.setTypeStr("结算差异");
+			ProdContractMaterialDiff closeFirst = clostList.get(0);
+			result.setSupplierName(closeFirst.getSupplierName());
+			result.setMaterialId(closeFirst.getMaterialId());
+			result.setMaterialName(closeFirst.getMaterialName());
+			result.setNorms(closeFirst.getNorms());
+			result.setModel(closeFirst.getModel());
+			result.setOutPlace(closeFirst.getOutPlace());
+			result.setNumUnit(closeFirst.getNumUnit());
+			result.setCostDiff(ComputeUtil.sum(clostList, ProdContractMaterialDiff::getCostDiff));
+			result.setUnitMaterialCostDiff(ComputeUtil.div(result.getCostDiff(), ComputeUtil.sum(clostList, ProdContractMaterialDiff::getCloseNum)));
+			result.setChildren(clostList);
+		}
+		return RestResponse.success(result);
+	}
+
+	// 处理key={车辆运输-数量差异,发站站台-数量差异,到站站台-数量差异}的map
+	private Map<String, List<ProdContractMaterialDiff>> handleNum(List<ProdContractMaterialDiff> numList) {
+		Map<String, List<ProdContractMaterialDiff>> result = new HashMap<>();
+		// 车辆运输-数量差异
+		// 不要发站站台差异 和 到站站台差异
+		result.put("车辆运输-数量差异", EntityUtils.filter(numList, v -> !v.getTypeStr().contains("站台差异")));
+		// 发站站台-数量差异
+		result.put("发站站台-数量差异", handleStation(numList, "发站站台差异"));
+		// 到站站台-数量差异
+		result.put("到站站台-数量差异", handleStation(numList, "到站站台差异"));
+		return result;
+	}
+
+	// 处理站台差异
+	private List<ProdContractMaterialDiff> handleStation(List<ProdContractMaterialDiff> numList,
+														 String type) {
+		List<ProdContractMaterialDiff> filter = EntityUtils.filter(numList, v -> v.getTypeStr().equals(type));
+		if (IsUtils.emptyList(filter)) {
+			return Lists.newArrayList();
+		}
+		List<ProdContractMaterialDiff> result = Lists.newArrayList();
+		EntityUtils.groupBy(filter, ProdContractMaterialDiff::getShippingOdd).forEach((k, v) -> {
+			ProdContractMaterialDiff vo = new ProdContractMaterialDiff();
+			vo.setTypeStr(type);
+			vo.setShippingOdd(k);
+			vo.setSendNum(ComputeUtil.sum(v, ProdContractMaterialDiff::getSendNum));
+			vo.setIntoWarehouseNum(ComputeUtil.sum(v, ProdContractMaterialDiff::getIntoWarehouseNum));
+			vo.setLossNum(ComputeUtil.sub(vo.getIntoWarehouseNum(), vo.getSendNum()));
+			vo.setExcludedPrice(ComputeUtil.anyValue(v, ProdContractMaterialDiff::getExcludedPrice));
+			vo.setCostDiff(ComputeUtil.mul(vo.getExcludedPrice(), vo.getLossNum()));
+			vo.setStatisticsDate(getStatisticsDate(v));
+			result.add(vo);
+		});
+		return result;
+	}
+
+	// TODO: 2023/6/15  获取结算日期,需要铁路发运结束才有
+	private String getStatisticsDate(List<ProdContractMaterialDiff> v) {
+		return null;
+	}
+
+
+	/**
+	 * 处理短运层
+	 *
+	 * @param transportList 运输列表
+	 * @return {@link List}<{@link ProdContractMaterialDiff}>
+	 */
+	private List<ProdContractMaterialDiff> handleShort(List<ProdContractMaterialDiff> transportList) {
+		List<ProdContractMaterialDiff> result = Lists.newArrayList();
+		EntityUtils.groupBy(transportList, ProdContractMaterialDiff::getTypeStr).forEach((k, v) -> {
+			ProdContractMaterialDiff vo = new ProdContractMaterialDiff();
+			vo.setTypeStr(k);
+			vo.setCostDiff(ComputeUtil.sum(v, ProdContractMaterialDiff::getCostDiff));
+			vo.setUnitMaterialCostDiff(ComputeUtil.sub(vo.getCostDiff(), ComputeUtil.sum(v, ProdContractMaterialDiff::getIntoWarehouseNum)));
+			vo.setChildren(v);
+			result.add(vo);
+		});
+		return result;
+	}
+
+	MesLogisticsShippingSend send = null;
+
+
+	/**
+	 * 通过铁路发站短运到货新增
+	 *
+	 * <p>
+	 * - 数量差异 上站短运
+	 * - 数量差异 发站站台差异
+	 * - 运输差异 发站短运差异
+	 * </p>
+	 */
+	public void addByRailwayStartSortArrive(MesLogisticsShippingSend transport) {
+		if (IsUtils.empty(transport)) {
+			return;
+		}
+		// 只处理铁路运输
+		if (Objects.equals(transport.getCarList().get(0).getTransportMode(), TransportModeEnum.RAILWAY)) {
+			send = transport;
+			// 数量差异 上站短运
+			handleNumStartShort();
+			// 数量差异 发站站台差异
+			handleNumStartStation("发站站台差异");
+			// 运输差异 发站短运差异
+			handleTransportStartShort("发站短运");
+		}
+	}
+
+
+	/**
+	 * 通过铁路装车
+	 * <p>
+	 * - 车辆运输-数量差异
+	 * - 发站站台-数量差异
+	 * - 运输差异-铁路运输
+	 * </p>
+	 *
+	 * @param train 铁路实体
+	 */
+	public void addByRailwayTrainLoading(MesLogisticsShippingSend train) {
+		if (IsUtils.empty(train)) {
+			return;
+		}
+		// 只处理铁路运输
+		if (!Objects.equals(train.getCarList().get(0).getTransportMode(), TransportModeEnum.RAILWAY)) {
+			return;
+		}
+		send = train;
+		// 车辆运输-数量差异-火车
+		handleNumTrain();
+		// 发站站台-数量差异
+		handleNumTrainStartStation("发站站台差异");
+		// 运输差异-铁路运输
+		handleTransportTrain("铁路运输");
+	}
+
+	/**
+	 * 通过铁路到货
+	 *
+	 * @param train 铁路实体
+	 */
+	public void addByRailwayTrainArrive(MesLogisticsShippingSend train) {
+		if (IsUtils.empty(train)) {
+			return;
+		}
+		// 只处理铁路运输
+		if (!Objects.equals(train.getCarList().get(0).getTransportMode(), TransportModeEnum.RAILWAY)) {
+			return;
+		}
+		send = train;
+		// 车辆运输-数量差异-火车
+		handleNumTrainArrive();
+		// 发站站台-数量差异
+		handleNumTrainStartStationArrive("到站站台差异");
+		// 运输差异-铁路运输
+		handleTransportTrainArrive("铁路运输");
+	}
+
+
+	/**
+	 * 通过到站短运装车
+	 *
+	 * @param train 实体
+	 */
+	public void addByRailwayEndShortLoading(MesLogisticsShippingSend train) {
+		if (IsUtils.empty(train)) {
+			return;
+		}
+		// 只处理铁路运输
+		if (!Objects.equals(train.getCarList().get(0).getTransportMode(), TransportModeEnum.RAILWAY)) {
+			return;
+		}
+		send = train;
+		// 车辆运输-数量差异
+		handleNumTrain();
+		// 到站站台-数量差异
+		handleNumTrainStartStation("到站站台差异");
+		// 运输差异-铁路运输
+		handleTransportTrain("铁路运输");
+	}
+
+	@EventListener
+	public void intoWarehouseEvent(IntoWarehouseEvent event) {
+		MESWarehouseMaterialInto into = event.getInto();
+		if (IsUtils.empty(into)) {
+			return;
+		}
+		// 不是铁路运输 直接滚蛋
+		if (!Objects.equals(into.getTransportMode(), TransportModeEnum.RAILWAY)) {
+			return;
+		}
+		// 数量差异 入库
+		handleNumIntoWarehouse(into);
+		// 运输差异
+		handleTransportIntoWarehouse(into);
+	}
+
+	// 数量差异 入库
+	private void handleNumIntoWarehouse(MESWarehouseMaterialInto into) {
+		ProdContractMaterialDiff diff = new ProdContractMaterialDiff();
+		// 材料成本差异d
+		diff.setId(IdUtils.getId());
+		MaterialDIffUtil.copyDiffForInto(diff, into);
+		// 差异编号
+		diff.setDiffOdd(OddUtils.generate(CodeRule.NUM_DIFF.getLabel()));
+		// 合同类型:简捷采购合同...
+		diff.setContractType(ContractTypeEnum.MATERIAL);
+		// 差异类别:数量差异运输差异结算差异库内差异
+		diff.setDiffType(ContractDiffTypeEnum.NUM);
+		save(diff);
+	}
+
+	// 运输差异 入库
+	private void handleTransportIntoWarehouse(MESWarehouseMaterialInto into) {
+		ProdContractMaterialDiff diff = new ProdContractMaterialDiff();
+		// 材料成本差异d
+		diff.setId(IdUtils.getId());
+		MaterialDIffUtil.copyDiffForInto(diff, into);
+		// 差异编号
+		diff.setDiffOdd(OddUtils.generate(CodeRule.TRANSPORT_DIFF.getLabel()));
+		// 合同类型:简捷采购合同...
+		diff.setContractType(ContractTypeEnum.MATERIAL);
+		// 差异类别:数量差异运输差异结算差异库内差异
+		diff.setDiffType(ContractDiffTypeEnum.TRANSPORT);
+		save(diff);
+	}
+
+
+	private void handleNumTrainArrive() {
+		ProdContractMaterialDiff diff = getTrainNumDiff();
+		// 到货数量
+		diff.setIntoWarehouseNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getArriveNum));
+		// 保存
+		save(diff);
+	}
+
+	private void handleNumTrainStartStationArrive(String label) {
+		ProdContractMaterialDiff diff = getNumDiffStation(CodeRule.NUM_DIFF, ContractDiffTypeEnum.NUM, label);
+		// 铁路到站数量
+		diff.setSendNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 保存
+		save(diff);
+	}
+
+	private void handleTransportTrainArrive(String label) {
+		ProdContractMaterialDiff diff = getTrainTransportDiff(label);
+		// 到货数量
+		diff.setIntoWarehouseNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getArriveNum));
+		// 保存
+		save(diff);
+	}
+
+	// 铁路运输差异
+	@NotNull
+	private ProdContractMaterialDiff getTrainTransportDiff(String label) {
+		ProdContractMaterialDiff diff = getNumDiffStation(CodeRule.TRANSPORT_DIFF, ContractDiffTypeEnum.TRANSPORT, label);
+		return diff;
+	}
+
+
+	@NotNull
+	private ProdContractMaterialDiff getNumDiffStation(CodeRule numDiff,
+													   ContractDiffTypeEnum num,
+													   String trainDiffTypeName) {
+		ProdContractMaterialDiff diff = new ProdContractMaterialDiff();
+		// 材料成本差异d
+		diff.setId(getId());
+		// 差异编号
+		diff.setDiffOdd(OddUtils.generate(numDiff.getLabel()));
+		// 采购合同id
+		diff.setPurchaseContractId(send.getContractId());
+		// 采购单号合同编号
+		diff.setPurchaseContractOdd(send.getContractOdd());
+		// 发运单号
+		diff.setShippingOdd(send.getShippingOdd());
+		// 发货单号
+		diff.setSendOdd(send.getSendOdd());
+		// 合同类型:简捷采购合同...
+		diff.setContractType(ContractTypeEnum.MATERIAL);
+		// 供应商
+		diff.setSupplierName(send.getSupplierName());
+		// 数量单位
+		diff.setNumUnit(send.getNumUnit());
+		// 差异类别:数量差异运输差异结算差异库内差异
+		diff.setDiffType(num);
+		// 汇算日期 = 入库日期
+		diff.setStatisticsDate(String.valueOf(send.getLoadingDate()));
+		// 不含税价格
+		MesLogisticsShippingSendMaterial sendMaterial1 = send.getMaterialList().get(0);
+		diff.setExcludedPrice(sendMaterial1.getExcludedPrice());
+		// 不含税运费
+		diff.setExcludedFare(sendMaterial1.getExcludedFare());
+		// 成本差异金额 (材料 | 运输)
+		diff.setCostDiff(BigDecimal.ZERO);
+		// 运输方式:公路运输铁路运输江海运输便捷发运
+		diff.setTransportMode(TransportModeEnum.RAILWAY);
+		// 类别(站到站-上站短运...)
+		diff.setTypeStr(trainDiffTypeName);
+		// 业务单号
+		diff.setBusinessOdd(send.getFareOdd());
+		return diff;
+	}
+
+
+	// 车辆运输-数量差异-火车
+	private void handleNumTrain() {
+		ProdContractMaterialDiff diff = getTrainNumDiff();
+		// 发货数量
+		diff.setSendNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 保存
+		save(diff);
+	}
+
+	// 铁路-数量差异
+	@NotNull
+	private ProdContractMaterialDiff getTrainNumDiff() {
+		ProdContractMaterialDiff diff = new ProdContractMaterialDiff();
+		// 材料成本差异d
+		diff.setId(getId());
+		// 差异编号
+		diff.setDiffOdd(OddUtils.generate(CodeRule.NUM_DIFF.getLabel()));
+		// 采购合同id
+		diff.setPurchaseContractId(send.getContractId());
+		// 采购单号合同编号
+		diff.setPurchaseContractOdd(send.getContractOdd());
+		// 发运单号
+		diff.setShippingOdd(send.getShippingOdd());
+		// 发货单号
+		diff.setSendOdd(send.getSendOdd());
+		// 合同类型:简捷采购合同...
+		diff.setContractType(ContractTypeEnum.MATERIAL);
+		// 供应商
+		diff.setSupplierName(send.getSupplierName());
+		// 数量单位
+		diff.setNumUnit(send.getNumUnit());
+		// 差异类别:数量差异运输差异结算差异库内差异
+		diff.setDiffType(ContractDiffTypeEnum.NUM);
+		// 汇算日期 = 入库日期
+		diff.setStatisticsDate(String.valueOf(send.getLoadingDate()));
+		// 不含税价格
+		MesLogisticsShippingSendMaterial sendMaterial1 = send.getMaterialList().get(0);
+		diff.setExcludedPrice(sendMaterial1.getExcludedPrice());
+		// 不含税运费
+		diff.setExcludedFare(sendMaterial1.getExcludedFare());
+		// 成本差异金额 (材料 | 运输)
+		diff.setCostDiff(BigDecimal.ZERO);
+		// 运输方式:公路运输铁路运输江海运输便捷发运
+		diff.setTransportMode(TransportModeEnum.RAILWAY);
+		// 类别(站到站-上站短运...)
+		MesLogisticsShippingSendCar mesLogisticsShippingSendCar = send.getCarList().get(0);
+		diff.setTypeStr(mesLogisticsShippingSendCar.getTransportMode().getLabel() + "-" + mesLogisticsShippingSendCar.getLoadingType().getLabel());
+		// 业务单号
+		diff.setBusinessOdd(send.getFareOdd());
+		return diff;
+	}
+
+	// 发站站台-数量差异
+	private void handleNumTrainStartStation(String label) {
+		ProdContractMaterialDiff diff = getNumDiffStation(CodeRule.NUM_DIFF, ContractDiffTypeEnum.NUM, label);
+		// 铁路装车数量 短运装车数量
+		diff.setIntoWarehouseNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 保存
+		save(diff);
+	}
+
+	// 运输差异-铁路运输
+	private void handleTransportTrain(String label) {
+		ProdContractMaterialDiff diff = getTrainTransportDiff(label);
+		// 发货数量
+		diff.setSendNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 保存
+		save(diff);
+	}
+
+	// 数量差异 上站短运
+	private void handleNumStartShort() {
+		ProdContractMaterialDiff diff = getTrainNumDiff();
+		// 发货数量
+		diff.setSendNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 到货数量
+		diff.setIntoWarehouseNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getArriveNum));
+		// 保存
+		save(diff);
+	}
+
+	// 数量差异 发站站台差异
+	private void handleNumStartStation(String label) {
+		ProdContractMaterialDiff diff = getNumDiffStation(CodeRule.NUM_DIFF, ContractDiffTypeEnum.NUM, label);
+		// 上站数量
+		diff.setSendNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 保存
+		save(diff);
+	}
+
+	// 运输差异 发站短运差异
+	private void handleTransportStartShort(String label) {
+		ProdContractMaterialDiff diff = getTrainTransportDiff(label);
+		// 发货数量
+		diff.setSendNum(ComputeUtil.sum(send.getCarList(), MesLogisticsShippingSendCar::getLoadingNum));
+		// 保存
+		save(diff);
+	}
+}
